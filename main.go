@@ -30,7 +30,7 @@ var loggerOpts = &slog.HandlerOptions{
 	ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
 		if a.Value.Kind() == slog.KindFloat64 {
 			f := a.Value.Float64()
-			return slog.String(a.Key, fmt.Sprintf("%.3f", f))
+			return slog.Any(a.Key, float643f(f))
 		}
 		return a
 	},
@@ -47,6 +47,7 @@ type conf struct {
 	Runs        *int          `json:"runs"`
 	OffsetRaw   *string       `json:"offset"`
 	Offset      time.Duration `json:"-"`
+	WarmupRuns  *int          `json:"warmup_runs"`
 }
 
 type hostWorkerInput struct {
@@ -144,6 +145,52 @@ func hostWorker(h *hostWorkerInput) {
 	logger.Info("host done", "host", h.host, "duration_seconds", time.Since(h.start).Seconds(), "run", h.run)
 }
 
+func run(hMap *hostmap.HostMap, conf *conf, i int) time.Duration {
+	logger.Info("start run", "run", i)
+
+	start := time.Now()
+
+	var wg sync.WaitGroup
+	for hostname, fileNames := range hMap.Hosts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			hostWorker(&hostWorkerInput{
+				host:      hostname,
+				conf:      conf,
+				fileNames: fileNames,
+				start:     start,
+				run:       i,
+			})
+		}()
+	}
+	wg.Wait()
+
+	duration := time.Since(start)
+
+	logger.Info("all hosts done", "duration_seconds", duration.Seconds(), "run", i)
+
+	return duration
+}
+
+func runBenchmark(hMap *hostmap.HostMap, conf *conf, runs int) []float64 {
+	runResults := make([]float64, 0, runs)
+
+	// start timing as late as possible to exclude setup time
+	for i, next := 1, time.Now(); i <= runs; i++ {
+		next = next.Add(conf.Offset)
+
+		duration := run(hMap, conf, i)
+		runResults = append(runResults, duration.Seconds())
+
+		if i < *conf.Runs {
+			time.Sleep(time.Until(next))
+		}
+	}
+
+	return runResults
+}
+
 func summarizeRunResults(runResults []float64) *runSummary {
 	// sort the results to calculate median
 	slices.Sort(runResults)
@@ -226,6 +273,7 @@ func main() {
 		Prefix:      flag.String("prefix", "u/fido", "prefix to add to s3 object names"),
 		Runs:        flag.Int("runs", 1, "run the benchmark this many times"),
 		OffsetRaw:   flag.String("offset", "30s", "offset between the start of runs"),
+		WarmupRuns:  flag.Int("warmup-runs", 0, "run this many warmup runs and discard the results"),
 	}
 
 	versionFlag := flag.Bool("version", false, "print version and exit")
@@ -264,41 +312,15 @@ func main() {
 		log.Fatalf("version mismatch between hosts: %v", err)
 	}
 
-	var wg sync.WaitGroup
-	runResults := make([]float64, 0, *conf.Runs)
-
-	// start timing as late as possible to exclude setup time
-	for i, next := 1, time.Now(); i <= *conf.Runs; i++ {
-		next = next.Add(offset)
-
-		start := time.Now()
-		logger.Info("start run", "run", i)
-
-		for hostname, fileNames := range hMap.Hosts {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				hostWorker(&hostWorkerInput{
-					host:      hostname,
-					conf:      conf,
-					fileNames: fileNames,
-					start:     start,
-					run:       i,
-				})
-			}()
-		}
-
-		wg.Wait()
-		duration := time.Since(start).Seconds()
-		runResults = append(runResults, duration)
-		logger.Info("all hosts done", "duration_seconds", duration, "run", i)
-
-		if i < *conf.Runs {
-			time.Sleep(time.Until(next))
-		}
+	if *conf.WarmupRuns > 0 {
+		logger.Info("start warmup runs", "warmup_runs", *conf.WarmupRuns)
+		_ = runBenchmark(hMap, conf, *conf.WarmupRuns)
+		logger.Info("all warmup runs done")
 	}
 
-	logger.Info("all runs done")
+	logger.Info("start benchmark runs", "runs", *conf.Runs)
+	runResults := runBenchmark(hMap, conf, *conf.Runs)
+	logger.Info("all bencharmk runs done")
 
 	summary := summarizeRunResults(runResults)
 
