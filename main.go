@@ -22,6 +22,8 @@ import (
 	"github.com/pkg/errors"
 	"gonum.org/v1/gonum/floats"
 	"gonum.org/v1/gonum/stat"
+
+	"github.com/jhoblitt/fido/version"
 )
 
 var loggerOpts = &slog.HandlerOptions{
@@ -69,6 +71,11 @@ type runSummary struct {
 	Min    float643f `json:"min_seconds"`
 	Max    float643f `json:"max_seconds"`
 	StdDev float643f `json:"stddev_seconds"`
+}
+
+type versionInfo struct {
+	Version string `json:"version"`
+	Config  conf   `json:"config"`
 }
 
 func sendFile(s3ndUrl, uri, file string, wg *sync.WaitGroup, h *hostWorkerInput) {
@@ -221,9 +228,18 @@ func main() {
 		OffsetRaw:   flag.String("offset", "30s", "offset between the start of runs"),
 	}
 
+	versionFlag := flag.Bool("version", false, "print version and exit")
+
 	flag.Parse()
 
 	slog.SetDefault(logger)
+
+	if *versionFlag {
+		fmt.Println(version.Version)
+		os.Exit(0)
+	}
+
+	logger.Info("fido version", "version", version.Version)
 
 	if *conf.InputDir == "" {
 		log.Fatal("dir flag is required")
@@ -286,10 +302,16 @@ func main() {
 
 	summary := summarizeRunResults(runResults)
 
-	var s3ndConfig s3ndversion.VersionInfo
+	var s3ndConf s3ndversion.VersionInfo
 	for _, v := range hostInfo {
-		s3ndConfig = v
-		break // take the first key, we already checked that all are the same
+		s3ndConf = v
+		break // take the first key, all are identical
 	}
-	logger.Info("summary of all runs", "summary", summary, "fido_config", conf, "s3nd_config", s3ndConfig)
+
+	fidoConf := versionInfo{
+		Version: version.Version,
+		Config:  *conf,
+	}
+
+	logger.Info("summary of all runs", "summary", summary, "fido", fidoConf, "s3nd", s3ndConf)
 }
