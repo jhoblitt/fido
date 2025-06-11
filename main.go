@@ -183,7 +183,7 @@ func runBenchmark(hMap *hostmap.HostMap, conf *conf, runs int) []float64 {
 		duration := run(hMap, conf, i)
 		runResults = append(runResults, duration.Seconds())
 
-		if i < *conf.Runs {
+		if i < runs {
 			time.Sleep(time.Until(next))
 		}
 	}
@@ -316,6 +316,8 @@ func main() {
 		logger.Info("start warmup runs", "warmup_runs", *conf.WarmupRuns)
 		_ = runBenchmark(hMap, conf, *conf.WarmupRuns)
 		logger.Info("all warmup runs done")
+		// don't start benchmark runs immediately after the last warmup run
+		time.Sleep(conf.Offset)
 	}
 
 	logger.Info("start benchmark runs", "runs", *conf.Runs)
