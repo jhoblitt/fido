@@ -1,8 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"net/http"
@@ -14,7 +16,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/jhoblitt/expfake/hostmap"
+	s3ndversion "github.com/lsst-dm/s3nd/version"
+	"github.com/pkg/errors"
 	"gonum.org/v1/gonum/floats"
 	"gonum.org/v1/gonum/stat"
 )
@@ -71,7 +76,7 @@ func sendFile(s3ndUrl, uri, file string, wg *sync.WaitGroup, h *hostWorkerInput)
 		defer wg.Done()
 
 		//nolint:gosec // G107 -- s3ndUrl is caller validated
-		resp, err := http.PostForm(s3ndUrl, url.Values{
+		r, err := http.PostForm(s3ndUrl, url.Values{
 			"file": {file},
 			"uri":  {uri},
 		})
@@ -79,9 +84,10 @@ func sendFile(s3ndUrl, uri, file string, wg *sync.WaitGroup, h *hostWorkerInput)
 			logger.Error("error sending file", "host", h.host, "file", file, "uri", uri, "err", err, "run", h.run)
 			os.Exit(1)
 		}
+		defer r.Body.Close()
 
-		if resp.StatusCode != 200 {
-			logger.Error("error sending file", "host", h.host, "response", resp, "run", h.run)
+		if r.StatusCode != 200 {
+			logger.Error("error sending file", "host", h.host, "response", r, "run", h.run)
 			os.Exit(1)
 		}
 	}()
@@ -146,6 +152,64 @@ func summarizeRunResults(runResults []float64) *runSummary {
 	}
 }
 
+func collectVersionInfo(hMap *hostmap.HostMap, conf *conf) (map[string]s3ndversion.VersionInfo, error) {
+	hostInfo := make(map[string]s3ndversion.VersionInfo, len(hMap.Hosts))
+	for hostname := range hMap.Hosts {
+		r, err := http.Get(fmt.Sprintf("http://%s:%d/version", hostname, *conf.Port))
+		if err != nil {
+			return nil, errors.Wrapf(err, "error checking version on host %s", hostname)
+		}
+		defer r.Body.Close()
+
+		if r.StatusCode != http.StatusOK {
+			return nil, errors.Errorf("s3nd on host %s returned status %d, expected 200", hostname, r.StatusCode)
+		}
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			return nil, errors.Errorf("error reading version info from host %s: %v", hostname, err)
+		}
+		vInfo := s3ndversion.VersionInfo{}
+		err = json.Unmarshal(body, &vInfo)
+		if err != nil {
+			return nil, errors.Errorf("error unmarshalling version info from host %s: %v", hostname, err)
+		}
+
+		hostInfo[hostname] = vInfo
+	}
+
+	return hostInfo, nil
+}
+
+// Compare all versions of s3nd running on the hosts and error if there are
+// differences.
+func checkVersionInfo(m map[string]s3ndversion.VersionInfo) error {
+	if len(m) == 0 {
+		return nil
+	}
+
+	// extract keys, map iteration is random
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+
+	// use the first key as the baseline for cmp
+	baselineKey := keys[0]
+	baseline := m[baselineKey]
+
+	for _, k := range keys[1:] {
+		cur := m[k]
+
+		if diff := cmp.Diff(baseline, cur); diff != "" {
+			return errors.Errorf("config mismatch between hosts %v and %v: %v", baselineKey, k, diff)
+		}
+	}
+
+	return nil
+}
+
 func main() {
 	conf := &conf{
 		HostMapPath: flag.String("hostmap", "hostmap.yaml", "Path to the hostmap file"),
@@ -173,10 +237,21 @@ func main() {
 
 	hMap := hostmap.Parse(conf.HostMapPath)
 
+	// collect conf of all s3nd hosts
+	hostInfo, err := collectVersionInfo(hMap, conf)
+	if err != nil {
+		log.Fatalf("error collecting version info: %v", err)
+	}
+	// require all s3nd hosts to have the same version & config
+	err = checkVersionInfo(hostInfo)
+	if err != nil {
+		log.Fatalf("version mismatch between hosts: %v", err)
+	}
+
 	var wg sync.WaitGroup
 	runResults := make([]float64, 0, *conf.Runs)
 
-	// start timing as late as possible to avoid including hostmap parsing time
+	// start timing as late as possible to exclude setup time
 	for i, next := 1, time.Now(); i <= *conf.Runs; i++ {
 		next = next.Add(offset)
 
@@ -211,5 +286,10 @@ func main() {
 
 	summary := summarizeRunResults(runResults)
 
-	logger.Info("summary of all runs", "summary", summary, "config", conf)
+	var s3ndConfig s3ndversion.VersionInfo
+	for _, v := range hostInfo {
+		s3ndConfig = v
+		break // take the first key, we already checked that all are the same
+	}
+	logger.Info("summary of all runs", "summary", summary, "fido_config", conf, "s3nd_config", s3ndConfig)
 }
