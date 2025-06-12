@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"sync"
@@ -42,12 +43,13 @@ type conf struct {
 	HostMapPath *string       `json:"hostmap"`
 	Bucket      *string       `json:"bucket"`
 	Port        *int          `json:"port"`
-	InputDir    *string       `json:"input_dir"`
+	InputDir    *string       `json:"dir"`
 	Prefix      *string       `json:"prefix"`
 	Runs        *int          `json:"runs"`
 	OffsetRaw   *string       `json:"offset"`
 	Offset      time.Duration `json:"-"`
-	WarmupRuns  *int          `json:"warmup_runs"`
+	WarmupRuns  *int          `json:"warmup-runs"`
+	SendFirst   *string       `json:"send-first"`
 }
 
 type hostWorkerInput struct {
@@ -103,6 +105,7 @@ func sendFile(s3ndUrl, uri, file string, wg *sync.WaitGroup, h *hostWorkerInput)
 
 func hostWorker(h *hostWorkerInput) {
 	var wg sync.WaitGroup
+	var sendFilter *regexp.Regexp
 
 	s3ndUrl := url.URL{
 		Scheme: "http",
@@ -110,28 +113,32 @@ func hostWorker(h *hostWorkerInput) {
 		Path:   "/upload",
 	}
 
-	for _, fName := range h.fileNames {
-		fullFilePath := filepath.Join(*h.conf.InputDir, fName)
+	if *h.conf.SendFirst != "" {
+		sendFilter = regexp.MustCompile(*h.conf.SendFirst)
 
-		// filter out non-json files
-		if filepath.Ext(fullFilePath) != ".json" {
-			continue
+		for _, fName := range h.fileNames {
+			fullFilePath := filepath.Join(*h.conf.InputDir, fName)
+
+			// filter out non-json files
+			if !sendFilter.MatchString(filepath.Ext(fullFilePath)) {
+				continue
+			}
+
+			uri := fmt.Sprintf("s3://%v/%v/%v", *h.conf.Bucket, *h.conf.Prefix, fName)
+
+			wg.Add(1)
+			sendFile(s3ndUrl.String(), uri, fullFilePath, &wg, h)
 		}
 
-		uri := fmt.Sprintf("s3://%v/%v/%v", *h.conf.Bucket, *h.conf.Prefix, fName)
-
-		wg.Add(1)
-		sendFile(s3ndUrl.String(), uri, fullFilePath, &wg, h)
+		wg.Wait()
+		logger.Info(fmt.Sprintf("%v done", *h.conf.SendFirst), "host", h.host, "duration_seconds", time.Since(h.start).Seconds(), "run", h.run)
 	}
-
-	wg.Wait()
-	logger.Info(".json done", "host", h.host, "duration_seconds", time.Since(h.start).Seconds(), "run", h.run)
 
 	for _, fName := range h.fileNames {
 		fullFilePath := filepath.Join(*h.conf.InputDir, fName)
 
 		// filter out json files
-		if filepath.Ext(fullFilePath) == ".json" {
+		if *h.conf.SendFirst != "" && sendFilter.MatchString(filepath.Ext(fullFilePath)) {
 			continue
 		}
 
@@ -274,6 +281,7 @@ func main() {
 		Runs:        flag.Int("runs", 1, "run the benchmark this many times"),
 		OffsetRaw:   flag.String("offset", "30s", "offset between the start of runs"),
 		WarmupRuns:  flag.Int("warmup-runs", 0, "run this many warmup runs and discard the results"),
+		SendFirst:   flag.String("send-first", "", "files matching this regular expression will be uploaded before all other files"),
 	}
 
 	versionFlag := flag.Bool("version", false, "print version and exit")
