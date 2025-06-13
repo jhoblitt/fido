@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -19,8 +20,9 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/jhoblitt/expfake/hostmap"
+	"github.com/lsst-dm/s3nd/upload"
 	s3ndversion "github.com/lsst-dm/s3nd/version"
-	"github.com/pkg/errors"
+	gherrors "github.com/pkg/errors"
 	"gonum.org/v1/gonum/floats"
 	"gonum.org/v1/gonum/stat"
 
@@ -67,7 +69,7 @@ func (f float643f) MarshalJSON() ([]byte, error) {
 	return []byte(strconv.FormatFloat(float64(f), 'f', 3, 64)), nil
 }
 
-type runSummary struct {
+type benchmarkSummary struct {
 	Runs   int       `json:"runs"`
 	Mean   float643f `json:"mean_seconds"`
 	Median float643f `json:"median_seconds"`
@@ -81,30 +83,72 @@ type versionInfo struct {
 	Config  conf   `json:"config"`
 }
 
-func sendFile(s3ndUrl, uri, file string, wg *sync.WaitGroup, h *hostWorkerInput) {
-	go func() {
-		defer wg.Done()
+func sendFile(s3ndUrl, uri url.URL, file string) error {
+	//nolint:gosec // G107 -- s3ndUrl is caller validated
+	r, err := http.PostForm(s3ndUrl.String(), url.Values{
+		"file": {file},
+		"uri":  {uri.String()},
+	})
+	defer r.Body.Close()
+	if err != nil {
+		return gherrors.Wrapf(err, "error sending file %q to uri %q", file, uri.String())
+	}
 
-		//nolint:gosec // G107 -- s3ndUrl is caller validated
-		r, err := http.PostForm(s3ndUrl, url.Values{
-			"file": {file},
-			"uri":  {uri},
-		})
-		if err != nil {
-			logger.Error("error sending file", "host", h.host, "file", file, "uri", uri, "err", err, "run", h.run)
-			os.Exit(1)
-		}
-		defer r.Body.Close()
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return gherrors.Errorf("error reading response from s3nd: %v", err)
+	}
+	status := upload.RequestStatus{}
+	err = json.Unmarshal(body, &status)
+	if err != nil {
+		return gherrors.Errorf("error unmarshalling response from s3nd: %v", err)
+	}
 
-		if r.StatusCode != 200 {
-			logger.Error("error sending file", "host", h.host, "response", r, "run", h.run)
-			os.Exit(1)
-		}
-	}()
+	if r.StatusCode != 200 {
+		return gherrors.Errorf("error sending file %q to uri %q, msg %q", file, uri.String(), status.Msg)
+	}
+
+	return nil
 }
 
-func hostWorker(h *hostWorkerInput) {
+// Send multiple files to the s3nd service in parallel.
+func sendFiles(s3ndUrl url.URL, files map[string]url.URL) error {
 	var wg sync.WaitGroup
+	errCh := make(chan error, len(files))
+	for f, uri := range files {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := sendFile(s3ndUrl, uri, f)
+			if err != nil {
+				logger.Error("error sending file", "file", f, "uri", uri.String(), "error", err)
+				errCh <- err
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	var errs []error
+	for e := range errCh {
+		if e != nil {
+			logger.Error("error", "error", e)
+			errs = append(errs, e)
+		} else {
+			logger.Info("file sent successfully", "error", e)
+		}
+	}
+	logger.Info("sendFiles finished", "files_count", len(files), "errors_count", len(errs))
+
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+
+	return nil
+}
+
+func hostWorker(h *hostWorkerInput) error {
 	var sendFilter *regexp.Regexp
 
 	s3ndUrl := url.URL{
@@ -116,6 +160,7 @@ func hostWorker(h *hostWorkerInput) {
 	if *h.conf.SendFirst != "" {
 		sendFilter = regexp.MustCompile(*h.conf.SendFirst)
 
+		files := make(map[string]url.URL, len(h.fileNames))
 		for _, fName := range h.fileNames {
 			fullFilePath := filepath.Join(*h.conf.InputDir, fName)
 
@@ -124,16 +169,23 @@ func hostWorker(h *hostWorkerInput) {
 				continue
 			}
 
-			uri := fmt.Sprintf("s3://%v/%v/%v", *h.conf.Bucket, *h.conf.Prefix, fName)
-
-			wg.Add(1)
-			sendFile(s3ndUrl.String(), uri, fullFilePath, &wg, h)
+			files[fullFilePath] = url.URL{
+				Scheme: "s3",
+				Host:   *h.conf.Bucket,
+				Path:   fmt.Sprintf("%v/%v", *h.conf.Prefix, fName),
+			}
 		}
 
-		wg.Wait()
+		err := sendFiles(s3ndUrl, files)
+		if err != nil {
+			logger.Error(fmt.Sprintf("%v failed", *h.conf.SendFirst), "host", h.host, "duration_seconds", time.Since(h.start).Seconds(), "run", h.run, "error", err)
+			return err
+		}
+
 		logger.Info(fmt.Sprintf("%v done", *h.conf.SendFirst), "host", h.host, "duration_seconds", time.Since(h.start).Seconds(), "run", h.run)
 	}
 
+	files := make(map[string]url.URL, len(h.fileNames))
 	for _, fName := range h.fileNames {
 		fullFilePath := filepath.Join(*h.conf.InputDir, fName)
 
@@ -142,27 +194,36 @@ func hostWorker(h *hostWorkerInput) {
 			continue
 		}
 
-		uri := fmt.Sprintf("s3://%v/%v/%v", *h.conf.Bucket, *h.conf.Prefix, fName)
-
-		wg.Add(1)
-		sendFile(s3ndUrl.String(), uri, fullFilePath, &wg, h)
+		files[fullFilePath] = url.URL{
+			Scheme: "s3",
+			Host:   *h.conf.Bucket,
+			Path:   fmt.Sprintf("%v/%v", *h.conf.Prefix, fName),
+		}
 	}
 
-	wg.Wait()
-	logger.Info("host done", "host", h.host, "duration_seconds", time.Since(h.start).Seconds(), "run", h.run)
+	err := sendFiles(s3ndUrl, files)
+	if err != nil {
+		logger.Error("host failed", "host", h.host, "duration_seconds", time.Since(h.start).Seconds(), "run", h.run, "error", err)
+		return err
+	}
+
+	logger.Info("host finished", "host", h.host, "duration_seconds", time.Since(h.start).Seconds(), "run", h.run)
+
+	return nil
 }
 
-func run(hMap *hostmap.HostMap, conf *conf, i int) time.Duration {
+func run(hMap *hostmap.HostMap, conf *conf, i int) (time.Duration, error) {
 	logger.Info("start run", "run", i)
 
 	start := time.Now()
 
 	var wg sync.WaitGroup
+	errCh := make(chan error, len(hMap.Hosts))
 	for hostname, fileNames := range hMap.Hosts {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			hostWorker(&hostWorkerInput{
+			errCh <- hostWorker(&hostWorkerInput{
 				host:      hostname,
 				conf:      conf,
 				fileNames: fileNames,
@@ -172,12 +233,22 @@ func run(hMap *hostmap.HostMap, conf *conf, i int) time.Duration {
 		}()
 	}
 	wg.Wait()
-
+	close(errCh)
 	duration := time.Since(start)
 
-	logger.Info("all hosts done", "duration_seconds", duration.Seconds(), "run", i)
+	var errs []error
+	for e := range errCh {
+		errs = append(errs, e)
+	}
 
-	return duration
+	if len(errs) > 0 {
+		logger.Error("run failed", "duration_seconds", duration.Seconds(), "run", i, "errors", errs)
+		return duration, errors.Join(errs...)
+	}
+
+	logger.Info("run finished", "duration_seconds", duration.Seconds(), "run", i)
+
+	return duration, nil
 }
 
 func runBenchmark(hMap *hostmap.HostMap, conf *conf, runs int) []float64 {
@@ -187,7 +258,10 @@ func runBenchmark(hMap *hostmap.HostMap, conf *conf, runs int) []float64 {
 	for i, next := 1, time.Now(); i <= runs; i++ {
 		next = next.Add(conf.Offset)
 
-		duration := run(hMap, conf, i)
+		duration, err := run(hMap, conf, i)
+		if err != nil {
+			logger.Error("error during benchmark", "error", err)
+		}
 		runResults = append(runResults, duration.Seconds())
 
 		if i < runs {
@@ -198,12 +272,12 @@ func runBenchmark(hMap *hostmap.HostMap, conf *conf, runs int) []float64 {
 	return runResults
 }
 
-func summarizeRunResults(runResults []float64) *runSummary {
+func summarizeBenchmarkResults(runResults []float64) *benchmarkSummary {
 	// sort the results to calculate median
 	slices.Sort(runResults)
 	median := stat.Quantile(0.5, stat.Empirical, runResults, nil)
 
-	return &runSummary{
+	return &benchmarkSummary{
 		Runs:   len(runResults),
 		Mean:   float643f(stat.Mean(runResults, nil)),
 		Median: float643f(median),
@@ -218,22 +292,22 @@ func collectVersionInfo(hMap *hostmap.HostMap, conf *conf) (map[string]s3ndversi
 	for hostname := range hMap.Hosts {
 		r, err := http.Get(fmt.Sprintf("http://%s:%d/version", hostname, *conf.Port))
 		if err != nil {
-			return nil, errors.Wrapf(err, "error checking version on host %s", hostname)
+			return nil, gherrors.Wrapf(err, "error checking version on host %s", hostname)
 		}
 		defer r.Body.Close()
 
 		if r.StatusCode != http.StatusOK {
-			return nil, errors.Errorf("s3nd on host %s returned status %d, expected 200", hostname, r.StatusCode)
+			return nil, gherrors.Errorf("s3nd on host %s returned status %d, expected 200", hostname, r.StatusCode)
 		}
 
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
-			return nil, errors.Errorf("error reading version info from host %s: %v", hostname, err)
+			return nil, gherrors.Errorf("error reading version info from host %s: %v", hostname, err)
 		}
 		vInfo := s3ndversion.VersionInfo{}
 		err = json.Unmarshal(body, &vInfo)
 		if err != nil {
-			return nil, errors.Errorf("error unmarshalling version info from host %s: %v", hostname, err)
+			return nil, gherrors.Errorf("error unmarshalling version info from host %s: %v", hostname, err)
 		}
 
 		hostInfo[hostname] = vInfo
@@ -264,7 +338,7 @@ func checkVersionInfo(m map[string]s3ndversion.VersionInfo) error {
 		cur := m[k]
 
 		if diff := cmp.Diff(baseline, cur); diff != "" {
-			return errors.Errorf("config mismatch between hosts %v and %v: %v", baselineKey, k, diff)
+			return gherrors.Errorf("config mismatch between hosts %v and %v: %v", baselineKey, k, diff)
 		}
 	}
 
@@ -329,10 +403,10 @@ func main() {
 	}
 
 	logger.Info("start benchmark runs", "runs", *conf.Runs)
-	runResults := runBenchmark(hMap, conf, *conf.Runs)
+	benchmarkResults := runBenchmark(hMap, conf, *conf.Runs)
 	logger.Info("all bencharmk runs done")
 
-	summary := summarizeRunResults(runResults)
+	summary := summarizeBenchmarkResults(benchmarkResults)
 
 	var s3ndConf s3ndversion.VersionInfo
 	for _, v := range hostInfo {
