@@ -6,7 +6,7 @@ RUN apk --update --no-cache add \
     && rm -rf /root/.cache
 WORKDIR /go/src/github.com/jhoblitt/fido
 COPY . .
-RUN make
+RUN make build
 
 FROM alpine:3
 WORKDIR /root/
